@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Background -->
+  <rect width="512" height="512" rx="92" fill="#1B4332"/>
+  
+  <!-- Yamazumi bars (bottom area) -->
+  <!-- Bar 1: 55% height, VA only -->
+  <rect x="61" y="343" width="55" height="105" fill="#22C55E" opacity=".9"/>
+  <!-- Bar 2: 100% height, constraint — VA + waste -->
+  <rect x="138" y="228" width="55" height="82" fill="#EF4444" opacity=".9"/>
+  <rect x="138" y="310" width="55" height="138" fill="#22C55E" opacity=".9"/>
+  <!-- Bar 3: 85% height, VA only -->
+  <rect x="215" y="268" width="55" height="180" fill="#22C55E" opacity=".9"/>
+  <!-- Bar 4: 65% height, VA only -->
+  <rect x="292" y="313" width="55" height="135" fill="#22C55E" opacity=".9"/>
+  <!-- Bar 5: 45% height, VA only -->
+  <rect x="369" y="352" width="55" height="96" fill="#22C55E" opacity=".9"/>
+  
+  <!-- Takt line (amber) — crosses all bars -->
+  <rect x="55" y="306" width="404" height="10" fill="#D97706" rx="5"/>
+
+  <!-- "Rx" text -->
+  <text x="62" y="198" font-family="'Arial Black','Impact','Franklin Gothic Heavy',Arial,sans-serif" font-size="152" font-weight="900" fill="white" letter-spacing="-4">Rx</text>
+</svg>
