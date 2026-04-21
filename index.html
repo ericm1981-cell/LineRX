@@ -514,6 +514,7 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);min-height:1
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn-demo" onclick="loadDemo()">▶ Load Demo</button>
+      <button class="btn btn-ghost btn-sm" onclick="triggerBulkImport()" title="Select all study JSONs — auto-groups by Plant-Line-Station filename convention">⬆ Bulk Import</button>
       <button class="btn btn-ghost btn-sm" onclick="triggerLoadSession()">↑ Load Session</button>
       <button class="btn btn-ghost btn-sm" onclick="addStation()">＋ Add Station</button>
       <button class="btn btn-forest" id="analyzeBtn" onclick="goAnalysis()" disabled>Analyze →</button>
@@ -555,6 +556,7 @@ body{font-family:var(--sans);background:var(--bg);color:var(--text);min-height:1
   <div class="station-list" id="stationList"></div>
   <input type="file" id="fileInput" style="display:none" multiple accept=".json">
   <input type="file" id="sessionInput" style="display:none" accept=".json">
+  <input type="file" id="bulkInput" style="display:none" multiple accept=".json">
   <div style="text-align:center">
     <button class="btn btn-ghost" onclick="addStation()" style="width:100%;max-width:400px">＋ Add Station</button>
   </div>
@@ -668,9 +670,9 @@ document.getElementById('fileInput').addEventListener('change',e=>{
       try{
         const d=JSON.parse(ev.target.result);
         if(d.app&&d.app!=='ProcessDx') return;
-        const opt=parseOption(d,f.name);
+        const opts=parseOptionsFromJSON(d,f.name); // returns array (1 or many)
         const st=stations.find(s=>s.id===sid);
-        if(st) st.options.push(opt);
+        if(st) opts.forEach(opt=>st.options.push(opt));
       }catch(e){ console.warn('Parse error',f.name,e); }
       if(++done===files.length) renderBuilder();
     };
@@ -678,7 +680,8 @@ document.getElementById('fileInput').addEventListener('change',e=>{
   });
 });
 
-function parseOption(data,filename){
+// ── Core option builder (shared by all import paths) ──
+function buildBaseSteps(data){
   const setup=data.setup||{}, variation=data.variation||{}, waste=data.waste||{},
         wt=data.wasteType||{}, nc=data.nonCyclicalSteps||{}, ergoSteps=data.ergoSteps||[];
   const stepNames=ergoSteps.length
@@ -695,13 +698,98 @@ function parseOption(data,filename){
     if(cls==='va') vaCT+=ct; else wasteCT+=ct;
     steps.push({name,ct,classification:cls,wasteType:wt[name]||''});
   });
+  return {steps,vaCT,wasteCT};
+}
+
+function makeOption(overrides){
   return {
-    id:uid(), filename, data, units:0, steps,
-    totalCT:vaCT+wasteCT, vaCT, wasteCT,
-    process:setup.process||setup.station||filename.replace(/\.json$/i,''),
-    rate:parseFloat(setup.rate)||0,
-    annShifts:parseFloat(setup.annualShifts)||0
+    id:uid(), filename:'', data:null, units:0,
+    steps:[], totalCT:0, vaCT:0, wasteCT:0,
+    process:'', rate:0, annShifts:0,
+    source:'json',
+    ...overrides
   };
+}
+
+// ── Main parser — returns array of options ──
+// Single-product JSON → 1 option
+// Multi-variant JSON (setup.variants + productMix) → N options, one per variant
+function parseOptionsFromJSON(data,filename){
+  const setup=data.setup||{};
+  const variants=setup.variants||[];
+  const productMix=data.productMix||[];
+  const rate=parseFloat(setup.rate)||0;
+  const annShifts=parseFloat(setup.annualShifts)||0;
+  const processName=setup.process||setup.station||filename.replace(/\.json$/i,'');
+  const {steps,vaCT,wasteCT}=buildBaseSteps(data);
+
+  // ── SINGLE-PRODUCT path (no variants) ──
+  if(!variants.length||!productMix.length){
+    return [makeOption({
+      filename, data, steps,
+      totalCT:vaCT+wasteCT, vaCT, wasteCT,
+      process:processName, rate, annShifts
+    })];
+  }
+
+  // ── MULTI-VARIANT path ──
+  // 1. Calculate per-variant avg CT from tagged cycles
+  const validCycles=(data.cycles||[]).slice(1).filter(c=>c&&c.length>0);
+  const taggedTotals={};
+  validCycles.forEach(cyc=>{
+    const tag=cyc.variant; if(!tag) return;
+    // Sum step durations, excluding eliminated steps
+    const ct=cyc.filter(s=>!s._elimSkip).reduce((sum,s)=>sum+(parseFloat(s.dur)||0),0);
+    if(!taggedTotals[tag]) taggedTotals[tag]=[];
+    taggedTotals[tag].push(ct);
+  });
+  const autoAvg={};
+  Object.keys(taggedTotals).forEach(k=>{
+    const arr=taggedTotals[k];
+    autoAvg[k]=arr.reduce((a,b)=>a+b,0)/arr.length;
+  });
+
+  // 2. Build one option per variant
+  return variants.map(variantName=>{
+    const mixEntry=productMix.find(m=>m.name===variantName)||{};
+    const ctOverride=mixEntry.ctOverride!=null?parseFloat(mixEntry.ctOverride):null;
+    const effectiveCT=(ctOverride!=null&&!isNaN(ctOverride))
+      ? ctOverride
+      : (autoAvg[variantName]||0);
+    const mixPct=parseFloat(mixEntry.mixPct)||0;
+    const cyclesTagged=(taggedTotals[variantName]||[]).length;
+    const source=ctOverride!=null?'override':(cyclesTagged>0?'tagged':'untagged');
+
+    // Scale step CTs: use effectiveCT as total, distribute proportionally from base steps
+    const baseTotalCT=vaCT+wasteCT;
+    const scale=baseTotalCT>0?effectiveCT/baseTotalCT:1;
+    let varVA=0,varWaste=0;
+    const varSteps=steps.map(s=>{
+      const scaledCT=+(s.ct*scale).toFixed(3);
+      if(s.classification==='va') varVA+=scaledCT; else varWaste+=scaledCT;
+      return {...s,ct:scaledCT};
+    });
+
+    return makeOption({
+      filename,
+      data,
+      steps:varSteps,
+      totalCT:effectiveCT,
+      vaCT:+(varVA.toFixed(3)),
+      wasteCT:+(varWaste.toFixed(3)),
+      process:`${processName} · ${variantName}`,
+      rate, annShifts,
+      variantName,
+      mixPct,       // carry mix% as a hint — user still confirms units
+      cyclesTagged,
+      ctSource:source  // 'tagged'|'override'|'untagged' — for display
+    });
+  });
+}
+
+// Legacy single-return shim (used by manual option and demo data)
+function parseOption(data,filename){
+  return parseOptionsFromJSON(data,filename)[0];
 }
 
 function setOptionUnits(sid,oid,v){
@@ -889,7 +977,7 @@ function renderBuilder(){
               <div class="opt-info">
                 <div class="opt-process">${esc(o.process)}</div>
                 <div class="opt-filename">${esc(o.filename)}</div>
-                <div class="opt-stats" id="optct_${o.id}">${o.totalCT.toFixed(1)}s CT · ${o.steps.length} steps · ${o.steps.filter(s=>s.classification==='va').length} VA / ${o.steps.filter(s=>s.classification!=='va').length} Waste</div>
+                <div class="opt-stats" id="optct_${o.id}">${o.totalCT.toFixed(1)}s CT · ${o.steps.length} steps · ${o.steps.filter(s=>s.classification==='va').length} VA / ${o.steps.filter(s=>s.classification!=='va').length} Waste${o.variantName?` · <span style="font-family:var(--font-mono);font-size:9px;background:var(--forest-dim);color:var(--forest);padding:1px 5px;border-radius:3px">${o.variantName}</span>`:''}${o.ctSource==='tagged'?` <span style="font-family:var(--font-mono);font-size:9px;color:#15803D">(${o.cyclesTagged} tagged cycles)</span>`:o.ctSource==='override'?` <span style="font-family:var(--font-mono);font-size:9px;color:var(--amber)">(manual CT)</span>`:''}${o.mixPct?` · mix hint: ${o.mixPct}%`:''}</div>
               </div>
               <div class="opt-units-row">
                 <input class="opt-units ${o.units>0?'filled':''}" type="number" min="0" step="1"
@@ -1823,6 +1911,120 @@ document.getElementById('sessionInput').addEventListener('change',e=>{
   };
   r.readAsText(f);
 });
+
+// ═══════════════════════════════════
+// BULK IMPORT — Plant-Line-Station naming convention
+// Separator: dash. No dashes within segments.
+// e.g. Viwinco-L2-ScreenBuild.json
+//      Viwinco-Casement-ScreenCuts.json
+// Also handles timestamped ProcessDx exports:
+//      Viwinco-L2-ScreenBuild_2026-04-17_0914_ProcessDx.json
+// ═══════════════════════════════════
+function triggerBulkImport(){
+  document.getElementById('bulkInput').click();
+}
+
+document.getElementById('bulkInput').addEventListener('change',e=>{
+  const files=Array.from(e.target.files); e.target.value='';
+  if(!files.length) return;
+
+  let done=0;
+  const parsed=[]; // [{filename, stationKey, opts}]
+
+  files.forEach(f=>{
+    if(!f.name.endsWith('.json')){ done++; return; }
+    const r=new FileReader();
+    r.onload=ev=>{
+      try{
+        const d=JSON.parse(ev.target.result);
+        if(d.app&&d.app!=='ProcessDx'){ done++; if(done===files.length) _finalizeBulk(parsed); return; }
+
+        // ── Parse station key from filename ──
+        // Convention: Plant_Line_Station_YYYY-MM-DD_HHMM_ProcessDx.json
+        // Station key = first three underscore-separated segments
+        // Date uses dashes internally — stripping is date-aware
+        // Fallback: setup.process from JSON, then full filename stem
+        const stem=f.name.replace(/\.json$/i,''); // strip .json — extractStationKey handles the rest
+        const stationKey=extractStationKey(stem, d);
+        const opts=parseOptionsFromJSON(d,f.name);
+        parsed.push({filename:f.name, stationKey, opts});
+      }catch(err){ console.warn('Bulk parse error',f.name,err); }
+      done++;
+      if(done===files.length) _finalizeBulk(parsed);
+    };
+    r.readAsText(f);
+  });
+});
+
+function extractStationKey(stem, data){
+  // Convention: Plant-Line-Station.json  (clean form)
+  // Also handles: Plant-Line-Station_YYYY-MM-DD_HHMM_ProcessDx (timestamped export)
+  // Separator = dash. No dashes within any segment.
+  // Strip _ProcessDx suffix and date/time block first, then split on dashes.
+  const cleaned=stem
+    .replace(/_ProcessDx$/i,'')          // remove _ProcessDx suffix
+    .replace(/_\d{4}-\d{2}-\d{2}.*/,'') // remove _YYYY-MM-DD and anything after
+    .replace(/_\d{6}$/,'')              // remove trailing _HHMMSS if present
+    .replace(/_\d{4}$/,'');             // remove trailing _HHMM if present
+
+  const parts=cleaned.split('-').filter(Boolean);
+  if(parts.length>=3){
+    // Three-segment match: Plant-Line-Station → use all three as the key
+    return parts.slice(0,3).join('-');
+  }
+  if(parts.length===2) return parts.join('-');
+  if(parts.length===1) return parts[0];
+  // Fallback to process name in JSON
+  return (data.setup&&data.setup.process) ? data.setup.process : cleaned;
+}
+
+function _finalizeBulk(parsed){
+  if(!parsed.length){ renderBuilder(); return; }
+
+  // Group by stationKey — preserve order of first occurrence
+  const groups={}; // {stationKey: opts[]}
+  const order=[];
+  parsed.forEach(({stationKey,opts,filename})=>{
+    if(!groups[stationKey]){ groups[stationKey]=[]; order.push(stationKey); }
+    opts.forEach(o=>groups[stationKey].push(o));
+  });
+
+  // Check for existing stations with matching names to avoid duplicates
+  const existingNames=new Set(stations.map(s=>(s.name||'').toLowerCase()));
+
+  // Build the banner message
+  const newCount=order.filter(k=>!existingNames.has(k.toLowerCase())).length;
+  const addCount=order.filter(k=>existingNames.has(k.toLowerCase())).length;
+
+  order.forEach(key=>{
+    const existing=stations.find(s=>(s.name||'').toLowerCase()===key.toLowerCase());
+    if(existing){
+      // Append new options to existing station
+      groups[key].forEach(opt=>existing.options.push(opt));
+    } else {
+      // Create new station
+      const st={id:uid(), name:key, constrained:false, options:groups[key]};
+      stations.push(st);
+    }
+  });
+
+  // Show bulk result banner
+  const banner=document.getElementById('demoBanner');
+  if(banner){
+    banner.style.display='flex';
+    banner.innerHTML=`<span class="demo-badge">BULK IMPORT</span>
+      ${parsed.length} file${parsed.length!==1?'s':''} imported ·
+      ${newCount} new station${newCount!==1?'s':''} created ·
+      ${addCount} existing station${addCount!==1?'s':''} updated ·
+      Rename stations if needed, then enter units.
+      <button onclick="document.getElementById('demoBanner').style.display='none'"
+        style="margin-left:auto;background:none;border:none;color:var(--forest);cursor:pointer;font-family:var(--font-mono);font-size:10px">✕</button>`;
+  }
+
+  renderBuilder();
+  checkBtn();
+}
+
 function moveStepOrder(sid,oid,displayIdx,dir){
   const st=stations.find(s=>s.id===sid); if(!st) return;
   const opt=st.options.find(o=>o.id===oid); if(!opt) return;
